@@ -1,3 +1,4 @@
+# %%
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals, print_function, division
 import string
@@ -8,6 +9,9 @@ import torch
 import codecs
 from tqdm import tqdm
 import string
+import subprocess
+import json
+import matplotlib.pyplot as plt
 
 #Set GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,6 +27,8 @@ attn_decoder = AttnDecoderRNN(output_size=output_lang.n_words, device=device)
 #Load the saved model weights into the RNN model
 encoder.load_state_dict(torch.load('model/encoder'))
 attn_decoder.load_state_dict(torch.load('model/decoder'))
+encoder = encoder.to(device)
+attn_decoder = attn_decoder.to(device)
 
 #Return the decoder output given input sentence 
 #Additionally, the previous predicted word and previous decoder state can also be given as input
@@ -89,73 +95,112 @@ def translate_example():
 ###################################################################################################################
 ###Part 1. Write the function below to read the data/test.fra file and write the translations in test_beam_1.out###
 ###################################################################################################################
-def translate_test():
-	#TODO: Write the function below
-    # Read the test data
+def translate_test(optimal_beam):
     with open('data/test.fra', 'r', encoding='utf-8') as file:
         test_sentences = file.readlines()
 
-    # Output file to save the translations
     with codecs.open('test_beam_1.out', 'w', encoding='utf-8') as output_file:
-        # Beam size
-        beam_size = 5  # You can adjust the beam size as needed
-
         for sentence in tqdm(test_sentences):
-            # Normalize and translate the sentence
+            input_sentence = normalizeString(sentence.strip())
+            translated_sentence = beam_search(encoder, attn_decoder, input_sentence, beam_size=optimal_beam)
+            output_file.write(translated_sentence + '\n')
+
+def translate_beam_size(beam_size):
+    with open('data/valid.fra', 'r', encoding='utf-8') as file:
+        valid_sentences = file.readlines()
+
+    output_filename = f'output_beam_{beam_size}.out'
+    with open(output_filename, 'w', encoding='utf-8') as output_file:
+        for sentence in tqdm(valid_sentences):
             input_sentence = normalizeString(sentence.strip())
             translated_sentence = beam_search(encoder, attn_decoder, input_sentence, beam_size=beam_size)
-
-            # Write the translation to the output file
             output_file.write(translated_sentence + '\n')
 
 #############################################################################################
 ###Part 2. Modify this function to use beam search to predict instead of greedy prediction###
 #############################################################################################
-def beam_search(encoder,decoder,input_sentence,beam_size=1,max_length=MAX_LENGTH):
-    decoded_output = []
-    
-    #Predicted the first word
-    decoder_output, decoder_hidden = translate_single_word(encoder, decoder, input_sentence, decoder_input=None, decoder_hidden=None)
-    
-    #Get the probability of all output words
-    decoder_output_probs = decoder_output.data
-    
-    #Select the id of the word with maximum probability
-    idx = torch.argmax(decoder_output_probs)
-	
-    #Convert the predicted id to the word
-    first_word = output_lang.index2word[idx.item()]
-    
-    #Add the predicted word to the output list and also set it as the previous prediction
-    decoded_output.append(first_word)
-    previous_decoded_output = first_word
-    
-    #Loop until the maximum length
-    for i in range(max_length):
-    
-        #Predict the next word given the previous prediction and the previous decoder hidden state
-        decoder_output, decoder_hidden = translate_single_word(encoder, decoder, input_sentence, previous_decoded_output, decoder_hidden)
+def beam_search(encoder, decoder, input_sentence, beam_size=1, max_length=MAX_LENGTH):
+    with torch.no_grad():
+        input_tensor = tensorFromSentence(input_lang, input_sentence, device)
+        initial_hidden = encoder.initHidden()
+        encoded_outputs = torch.zeros(max_length, encoder.hidden_size, device=device)
         
-        #Get the probability of all output words
-        decoder_output_probs = decoder_output.data
+        for idx in range(input_tensor.size()[0]):
+            output, initial_hidden = encoder(input_tensor[idx], initial_hidden)
+            encoded_outputs[idx] = output[0, 0]
+        initial_beams = [(torch.tensor([[SOS_token]], device=device), initial_hidden, [], 0)]
         
-        #Select the id of the word with maximum probability
-        idx = torch.argmax(decoder_output_probs)
+        first_output, hidden_state = translate_single_word(encoder, decoder, input_sentence)
+        top_values, top_indices = first_output.data.topk(beam_size)
         
-        #Break if end of sentence is predicted
-        if idx.item() == EOS_token:
-            break 
+        updated_beams = []
+        for i in range(beam_size):
+            word_idx = top_indices[0][i].item()
+            word = output_lang.index2word[word_idx]
+            beam_score = top_values[0][i].item()
+            beam = (torch.tensor([[word_idx]], device=device), hidden_state, [word], beam_score)
+            updated_beams.append(beam)
+        initial_beams = updated_beams
+
+        for _ in range(max_length - 1):
+            expanded_beams = []
+            for current_beam in initial_beams:
+                current_input, current_hidden, current_words, current_score = current_beam
+                if current_words[-1] == EOS_token:
+                    expanded_beams.append(current_beam)
+                    continue
+
+                next_output, next_hidden, _ = decoder(current_input, current_hidden, encoded_outputs)
+                next_values, next_indices = next_output.data.topk(beam_size)
+                for i in range(beam_size):
+                    next_word_idx = next_indices[0][i].item()
+                    next_word = output_lang.index2word[next_word_idx]
+                    updated_score = current_score + next_values[0][i].item()
+                    new_beam = (torch.tensor([[next_word_idx]], device=device), next_hidden, current_words + [next_word], updated_score)
+                    expanded_beams.append(new_beam)
             
-        #Else add the predicted word to the list
-        else:
-            #Convert the predicted id to the word
-            selected_word = output_lang.index2word[idx.item()]
-            
-            #Add the predicted word to the output list and update the previous prediction
-            decoded_output.append(selected_word)    
-            previous_decoded_output = selected_word
-            
-    #Convert list of predicted words to a sentence and detokenize 
-    output_translation = " ".join(i for i in decoded_output)
-    
-    return output_translation
+            sorted_beams = sorted(expanded_beams, key=lambda x: x[3], reverse=True)
+            initial_beams = sorted_beams[:beam_size]
+
+        sorted_beams = sorted(initial_beams, key=lambda x:x[3], reverse=True)
+        top_beam = sorted_beams[0]
+        output_translation = ' '.join(top_beam[2])
+        return output_translation
+
+# %%
+for k in tqdm(range(1, 21)):
+    translate_beam_size(k)
+
+# %%
+bleu_scores = []
+
+for i in tqdm(range(1, 21)):
+    output_file = f'output_beam_{i}.out'
+    cmd = ['sacrebleu', 'data/valid.eng', '-i', output_file, '-m', 'bleu']
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+    output = result.stdout.strip()
+    bleu_result = json.loads(output)
+    score = bleu_result["score"]
+    bleu_scores.append(score)
+
+beam_sizes = list(range(1, 21))
+plt.figure(figsize=(12, 6))
+plt.plot(beam_sizes, bleu_scores, marker='o')
+plt.xlabel('Beam Size')
+plt.ylabel('BLEU Score')
+plt.title('BLEU Scores for Different Beam Sizes')
+plt.xticks(beam_sizes)
+plt.grid(True)
+plt.savefig('bleu_scores_plot.png')
+plt.show()
+
+# %% [markdown]
+# ## The best K we got from part 3 is 2
+
+# %%
+translate_test(2)
+
+# %%
+# !sacrebleu data/test.eng < test_beam_1.out
+
+
